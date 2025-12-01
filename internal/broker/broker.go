@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/kagenti/mcp-gateway/internal/config"
@@ -27,6 +28,14 @@ type downstreamSessionID string
 
 // upstreamSessionID is for session IDs the gateway uses with upstream MCP servers
 type upstreamSessionID string
+
+// contextKey is a type for context keys
+type contextKey string
+
+const (
+	// sessionIDKey is the context key for storing the current session ID
+	sessionIDKey contextKey = "mcp-gateway-session-id"
+)
 
 // upstreamMCPURL identifies an upstream MCP server
 type upstreamMCPURL string
@@ -142,6 +151,10 @@ type mcpBrokerImpl struct {
 
 	logger *slog.Logger
 
+	// sessionMap tracks the current session ID for each active client session
+	// This is populated by the OnRegisterSession hook and used by tool handlers
+	sessionMap sync.Map // map[string]string - maps some identifier to session ID
+
 	// enforceToolFilter if set will ensure only a filtered list of tools is returned this list is based on the x-authorized-tools trusted header
 	enforceToolFilter bool
 
@@ -183,14 +196,20 @@ func NewBroker(logger *slog.Logger, opts ...func(*mcpBrokerImpl)) MCPBroker {
 	hooks := &server.Hooks{}
 
 	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
-		slog.Info("Client disconnected", "sessionID", session.SessionID())
+		sessionID := session.SessionID()
+		slog.Info("Client disconnected", "sessionID", sessionID)
+		// Clean up the session from the map
+		mcpBkr.sessionMap.Delete("current")
 	})
 
 	// Enhanced session registration to log gateway session assignment
 	hooks.AddOnRegisterSession(func(_ context.Context, session server.ClientSession) {
 		// Note that AddOnRegisterSession is for GET, not POST, for a session.
 		// https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#listening-for-messages-from-the-server
-		slog.Info("Gateway client connected with session", "gatewaySessionID", session.SessionID())
+		sessionID := session.SessionID()
+		slog.Info("Gateway client connected with session", "gatewaySessionID", sessionID)
+		// Store the session ID in the map for later retrieval
+		mcpBkr.sessionMap.Store("current", sessionID)
 	})
 
 	hooks.AddBeforeAny(func(_ context.Context, _ any, method mcp.MCPMethod, _ any) {
@@ -294,7 +313,7 @@ func (m *mcpBrokerImpl) RegisterServerWithConfig(
 	}
 	slog.Info("Discovered tools", "mcpURL", mcpServer.URL, "num tools", len(newTools))
 	slog.Info("Server registered", "url", mcpServer.URL, "totalServers", len(m.mcpServers))
-	m.listeningMCPServer.AddTools(toolsToServerTools(mcpServer.URL, newTools)...)
+	m.listeningMCPServer.AddTools(m.toolsToServerTools(mcpServer.URL, newTools)...)
 
 	return nil
 }
@@ -480,7 +499,7 @@ func (m *mcpBrokerImpl) discoverTools(ctx context.Context, upstream *upstreamMCP
 			// Add any tools added since the last notification
 			if len(newlyAddedTools) > 0 {
 				m.logger.Info("Adding tools", "mcpURL", upstream.URL, "#tools", len(newlyAddedTools))
-				m.listeningMCPServer.AddTools(toolsToServerTools(upstream.URL, newlyAddedTools)...)
+				m.listeningMCPServer.AddTools(m.toolsToServerTools(upstream.URL, newlyAddedTools)...)
 			}
 
 			// Delete any tools removed since the last notification
@@ -551,7 +570,7 @@ func (m *mcpBrokerImpl) retryDiscovery(ctx context.Context, upstream *upstreamMC
 			"attempt", attempt,
 			"tools", len(newTools))
 
-		m.listeningMCPServer.AddTools(toolsToServerTools(upstream.URL, newTools)...)
+		m.listeningMCPServer.AddTools(m.toolsToServerTools(upstream.URL, newTools)...)
 		return true, nil
 	})
 	if err != nil {
@@ -811,29 +830,35 @@ func (upstream *upstreamMCP) prefixedName(tool string) toolName {
 	return toolName(fmt.Sprintf("%s%s", upstream.ToolPrefix, tool))
 }
 
-func toolToServerTool(newTool mcp.Tool) server.ServerTool {
+func (m *mcpBrokerImpl) toolToServerTool(newTool mcp.Tool) server.ServerTool {
 	return server.ServerTool{
 		Tool: newTool,
-		Handler: func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return mcp.NewToolResultError("Kagenti MCP Broker doesn't forward tool calls"), nil
-		},
-		/* UNCOMMENT THIS TO TURN THE BROKER INTO A STAND-ALONE GATEWAY
 		Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			// Get session ID from the session map
+			// For now, we use "current" as the key since we only track one active session
+			// In a multi-client scenario, we'd need a better key (e.g., from request headers)
+			sessionID := ""
+			if sessionIDValue, ok := m.sessionMap.Load("current"); ok {
+				if sid, ok := sessionIDValue.(string); ok {
+					sessionID = sid
+				}
+			}
+
+			// If no session ID found, use empty string (broker will handle session creation)
 			result, err := m.CallTool(ctx,
-				downstreamSessionID(request.GetString("Mcp-Session-Id", "")),
+				downstreamSessionID(sessionID),
 				request,
 			)
 			return result, err
-		}
-		*/
+		},
 	}
 }
 
-func toolsToServerTools(mcpURL string, newTools []mcp.Tool) []server.ServerTool {
+func (m *mcpBrokerImpl) toolsToServerTools(mcpURL string, newTools []mcp.Tool) []server.ServerTool {
 	tools := make([]server.ServerTool, 0)
 	for _, newTool := range newTools {
-		slog.Info("Federating tool", "mcpURL", mcpURL, "federated name", newTool.Name)
-		tools = append(tools, toolToServerTool(newTool))
+		m.logger.Info("Federating tool", "mcpURL", mcpURL, "federated name", newTool.Name)
+		tools = append(tools, m.toolToServerTool(newTool))
 	}
 
 	return tools
